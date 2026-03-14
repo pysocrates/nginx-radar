@@ -47,6 +47,7 @@ LOG="/var/log/nginx/access.log"
 ERROR_LOG="/var/log/nginx/error.log"
 FAIL2BAN_LOG="/var/log/fail2ban.log"
 FAIL2BAN_CLIENT_PREFIX=""
+NGINX_FD_PREFIX=""
 ```
 
 Then run:
@@ -71,6 +72,7 @@ Most useful settings:
 - `ERROR_LOG`: nginx error log path
 - `FAIL2BAN_LOG`: Fail2Ban log path
 - `FAIL2BAN_CLIENT_PREFIX`: optional prefix for `fail2ban-client`, for example `sudo -n`
+- `NGINX_FD_PREFIX`: optional prefix for nginx fd inspection, for example `sudo -n`
 - `REFRESH_SECONDS`: dashboard redraw interval
 - `TOP_N`: number of top rows to show per ranked panel
 - `BURST_WINDOW_SECONDS`: short burst window
@@ -92,6 +94,14 @@ FAIL2BAN_CLIENT_PREFIX="sudo -n"
 ```
 
 That requires passwordless sudo for `fail2ban-client`; `-n` makes the snapshot fail fast instead of hanging on a prompt.
+
+If nginx fd inspection needs sudo, set:
+
+```bash
+NGINX_FD_PREFIX="sudo -n"
+```
+
+That lets the snapshot count `/proc/<nginx-pid>/fd` without changing the rest of the metric collection.
 
 ## Remote Commands
 

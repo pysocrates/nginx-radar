@@ -67,6 +67,7 @@ ENABLE_SS="${ENABLE_SS:-1}"
 ENABLE_SYSTEM_METRICS="${ENABLE_SYSTEM_METRICS:-1}"
 ENABLE_FAIL2BAN_STATUS="${ENABLE_FAIL2BAN_STATUS:-1}"
 FAIL2BAN_CLIENT_PREFIX="${FAIL2BAN_CLIENT_PREFIX:-}"
+NGINX_FD_PREFIX="${NGINX_FD_PREFIX:-}"
 SYSTEM_LOAD_AVG="n/a"
 SYSTEM_MEMORY_USAGE="n/a"
 FAIL2BAN_ACTIVE_JAILS=0
@@ -807,9 +808,14 @@ process_tagged_line() {
 build_snapshot_remote_command() {
     local command=""
     local fail2ban_client_cmd="fail2ban-client"
+    local nginx_fd_count_cmd='ls -1 "/proc/$pid/fd" 2>/dev/null | wc -l'
 
     if [[ -n "$FAIL2BAN_CLIENT_PREFIX" ]]; then
         fail2ban_client_cmd="${FAIL2BAN_CLIENT_PREFIX} fail2ban-client"
+    fi
+
+    if [[ -n "$NGINX_FD_PREFIX" ]]; then
+        nginx_fd_count_cmd="${NGINX_FD_PREFIX} sh -c 'ls -1 \"/proc/\$1/fd\" 2>/dev/null | wc -l' sh \"\$pid\""
     fi
 
     command+="export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH\"; "
@@ -826,7 +832,7 @@ build_snapshot_remote_command() {
     if (( ENABLE_SYSTEM_METRICS == 1 )); then
         command+="printf '__SECTION__:UPTIME\n'; uptime 2>/dev/null || true; "
         command+="printf '__SECTION__:FREE\n'; free -m 2>/dev/null || true; "
-        command+="printf '__SECTION__:NGINXFD\n'; pid=\$(pgrep -o nginx 2>/dev/null || true); if [ -z \"\$pid\" ]; then printf 'pid=none fds=n/a\n'; elif ls -1 \"/proc/\$pid/fd\" >/dev/null 2>&1; then printf 'pid=%s fds=%s\n' \"\$pid\" \"\$(ls -1 /proc/\$pid/fd 2>/dev/null | wc -l)\"; else printf 'pid=%s fds=n/a\n' \"\$pid\"; fi; "
+        command+="printf '__SECTION__:NGINXFD\n'; pid=\$(pgrep -o nginx 2>/dev/null || true); if [ -z \"\$pid\" ]; then printf 'pid=none fds=n/a\n'; else fd_count=\$(${nginx_fd_count_cmd}); if [[ \"\$fd_count\" =~ ^[0-9]+$ ]]; then printf 'pid=%s fds=%s\n' \"\$pid\" \"\$fd_count\"; else printf 'pid=%s fds=n/a\n' \"\$pid\"; fi; fi; "
     fi
 
     if (( ENABLE_FAIL2BAN_STATUS == 1 )); then
