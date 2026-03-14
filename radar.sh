@@ -71,6 +71,7 @@ FAIL2BAN_ACTIVE_JAILS=0
 FAIL2BAN_CURRENT_BANS=0
 FAIL2BAN_TOTAL_BANS=0
 SNAPSHOT_COLLECTING=0
+SNAPSHOT_LAST_APPLIED="never"
 SSH_KEY_PATH=""
 NGINX_OPEN_FDS="n/a"
 declare -a SSH_ARGS=()
@@ -401,6 +402,7 @@ render_dashboard() {
         "$rpm" "$new_ips" "$avg_size" "$tls_handshake_error_count"
     printf 'Load: %s | Mem: %s | nginx fd: %s | UFW deny: %s | F2B current bans: %s\n' \
         "$SYSTEM_LOAD_AVG" "$SYSTEM_MEMORY_USAGE" "$NGINX_OPEN_FDS" "${#ufw_rules[@]}" "$FAIL2BAN_CURRENT_BANS"
+    printf 'Snapshot: %s\n' "$SNAPSHOT_LAST_APPLIED"
     printf 'Access: %s (%s) | Error: %s (%s) | Fail2Ban log: %s (%s)\n' \
         "$LOG" "$NGINX_LINES_PROCESSED" "$ERROR_LOG" "$ERROR_LINES_PROCESSED" "$FAIL2BAN_LOG" "$FAIL2BAN_LINES_PROCESSED"
     printf 'Updated: %s\n\n' "$(date '+%Y-%m-%d %H:%M:%S')"
@@ -596,6 +598,7 @@ apply_snapshot_buffer() {
     FAIL2BAN_ACTIVE_JAILS="$new_active_jails"
     FAIL2BAN_CURRENT_BANS="$new_current_bans"
     FAIL2BAN_TOTAL_BANS="$new_total_bans"
+    SNAPSHOT_LAST_APPLIED="$(date '+%Y-%m-%d %H:%M:%S')"
 }
 
 process_nginx_line() {
@@ -696,6 +699,7 @@ process_tagged_line() {
 build_snapshot_remote_command() {
     local command=""
 
+    command+="export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH\"; "
     command+="printf '__SNAPSHOT_BEGIN__\n'; "
 
     if (( ENABLE_UFW == 1 )); then
@@ -714,9 +718,9 @@ build_snapshot_remote_command() {
 
     if (( ENABLE_FAIL2BAN_STATUS == 1 )); then
         command+="printf '__SECTION__:F2BTOP\n'; fail2ban-client status 2>/dev/null || true; "
-        command+="for jail in \$(fail2ban-client status 2>/dev/null | awk -F': ' '/Jail list:/ {gsub(/,/, \"\", \\$2); print \\$2}'); do "
-        command+="printf '__SECTION__:JAIL:%s\n' \"\\$jail\"; "
-        command+="fail2ban-client status \"\\$jail\" 2>/dev/null || true; "
+        command+="for jail in \$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do "
+        command+="printf '__SECTION__:JAIL:%s\n' \"\$jail\"; "
+        command+="fail2ban-client status \"\$jail\" 2>/dev/null || true; "
         command+="done; "
     fi
 
