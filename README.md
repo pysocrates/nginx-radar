@@ -46,6 +46,7 @@ KEY=""
 LOG="/var/log/nginx/access.log"
 ERROR_LOG="/var/log/nginx/error.log"
 FAIL2BAN_LOG="/var/log/fail2ban.log"
+FAIL2BAN_CLIENT_PREFIX=""
 ```
 
 Then run:
@@ -69,6 +70,7 @@ Most useful settings:
 - `LOG`: nginx access log path
 - `ERROR_LOG`: nginx error log path
 - `FAIL2BAN_LOG`: Fail2Ban log path
+- `FAIL2BAN_CLIENT_PREFIX`: optional prefix for `fail2ban-client`, for example `sudo -n`
 - `REFRESH_SECONDS`: dashboard redraw interval
 - `TOP_N`: number of top rows to show per ranked panel
 - `BURST_WINDOW_SECONDS`: short burst window
@@ -82,6 +84,14 @@ Feature toggles:
 - `ENABLE_SS=0` if you do not want live TCP connection counts
 - `ENABLE_SYSTEM_METRICS=0` if you do not want `uptime`, `free`, or nginx fd stats
 - `ENABLE_FAIL2BAN_STATUS=0` if `fail2ban-client` is unavailable
+
+If `fail2ban-client status` requires sudo on the server, set:
+
+```bash
+FAIL2BAN_CLIENT_PREFIX="sudo -n"
+```
+
+That requires passwordless sudo for `fail2ban-client`; `-n` makes the snapshot fail fast instead of hanging on a prompt.
 
 ## Remote Commands
 

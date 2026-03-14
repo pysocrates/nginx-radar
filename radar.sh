@@ -37,6 +37,7 @@ declare -A fail2ban_action_counts=()
 declare -A fail2ban_jail_counts=()
 declare -A fail2ban_ip_counts=()
 declare -A live_connection_counts=()
+declare -A live_connection_state_counts=()
 declare -A error_signal_counts=()
 declare -A fail2ban_current_bans_by_jail=()
 declare -a scanner_events=()
@@ -65,6 +66,7 @@ ENABLE_UFW="${ENABLE_UFW:-1}"
 ENABLE_SS="${ENABLE_SS:-1}"
 ENABLE_SYSTEM_METRICS="${ENABLE_SYSTEM_METRICS:-1}"
 ENABLE_FAIL2BAN_STATUS="${ENABLE_FAIL2BAN_STATUS:-1}"
+FAIL2BAN_CLIENT_PREFIX="${FAIL2BAN_CLIENT_PREFIX:-}"
 SYSTEM_LOAD_AVG="n/a"
 SYSTEM_MEMORY_USAGE="n/a"
 FAIL2BAN_ACTIVE_JAILS=0
@@ -357,6 +359,73 @@ build_recent_section() {
     done
 }
 
+shorten_tcp_state() {
+    case "$1" in
+        ESTAB) printf 'ESTAB\n' ;;
+        SYN-SENT) printf 'SYNSNT\n' ;;
+        SYN-RECV) printf 'SYNRCV\n' ;;
+        FIN-WAIT-1) printf 'FIN1\n' ;;
+        FIN-WAIT-2) printf 'FIN2\n' ;;
+        TIME-WAIT) printf 'TWAIT\n' ;;
+        CLOSE-WAIT) printf 'CLWAIT\n' ;;
+        LAST-ACK) printf 'LACK\n' ;;
+        CLOSING) printf 'CLOSNG\n' ;;
+        CLOSED) printf 'CLOSED\n' ;;
+        LISTEN) printf 'LISTEN\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+build_live_tcp_section() {
+    local out_name="$1"
+    declare -n out="$out_name"
+    local state_rows connection_rows
+    local key value ip state shown=0
+
+    out=(
+        "Live TCP"
+    )
+
+    if (( ${#live_connection_counts[@]} == 0 )); then
+        out+=("waiting for data")
+        return
+    fi
+
+    if (( ${#live_connection_state_counts[@]} > 0 )); then
+        out+=("State totals")
+        state_rows=$(
+            for key in "${!live_connection_state_counts[@]}"; do
+                printf '%s\t%s\n' "$key" "${live_connection_state_counts[$key]}"
+            done | LC_ALL=C sort -t $'\t' -k2,2nr -k1,1 | head -n 3
+        )
+
+        while IFS=$'\t' read -r key value; do
+            [[ -z "${key:-}" ]] && continue
+            out+=("$(printf '%-15s %4s' "$(shorten_tcp_state "$key")" "$value")")
+            ((shown++))
+        done <<<"$state_rows"
+
+        if (( shown > 0 )); then
+            out+=("")
+        fi
+    fi
+
+    out+=("$(printf '%-15s %-7s %4s' "Peer IP" "State" "Cnt")")
+
+    connection_rows=$(
+        for key in "${!live_connection_counts[@]}"; do
+            printf '%s\t%s\n' "$key" "${live_connection_counts[$key]}"
+        done | LC_ALL=C sort -t $'\t' -k2,2nr -k1,1 | head -n "$TOP_N"
+    )
+
+    while IFS=$'\t' read -r key value; do
+        [[ -z "${key:-}" ]] && continue
+        ip="${key%%|*}"
+        state="${key#*|}"
+        out+=("$(printf '%-15s %-7s %4s' "$ip" "$(shorten_tcp_state "$state")" "$value")")
+    done <<<"$connection_rows"
+}
+
 render_dashboard() {
     local rpm
     local new_ips
@@ -380,7 +449,7 @@ render_dashboard() {
 
     build_ranked_section ip_section "Top IPs" ip_counts "$TOP_N" "$(printf '%-15s %6s' "IP" "Hits")" '%-15s %6s' "waiting for data"
     build_ranked_section network_section "Top Networks" network_counts "$TOP_N" "$(printf '%-16s %5s' "/24" "Hits")" '%-16s %5s' "waiting for data"
-    build_ranked_section live_tcp_section "Live TCP" live_connection_counts "$TOP_N" "$(printf '%-15s %6s' "Source IP" "Conn")" '%-15s %6s' "waiting for data"
+    build_live_tcp_section live_tcp_section
     build_ranked_section endpoint_section "Top Endpoints" endpoint_counts "$TOP_N" "$(printf '%-36s %6s' "Path" "Hits")" '%-36s %6s' "waiting for data"
     build_ranked_section agent_section "Top Agents" user_agent_counts "$TOP_N" "$(printf '%-28s %6s' "Agent" "Hits")" '%-28s %6s' "waiting for data"
     build_method_section method_section
@@ -407,7 +476,7 @@ render_dashboard() {
         "$LOG" "$NGINX_LINES_PROCESSED" "$ERROR_LOG" "$ERROR_LINES_PROCESSED" "$FAIL2BAN_LOG" "$FAIL2BAN_LINES_PROCESSED"
     printf 'Updated: %s\n\n' "$(date '+%Y-%m-%d %H:%M:%S')"
 
-    print_three_columns ip_section network_section live_tcp_section 24 24 24
+    print_three_columns ip_section network_section live_tcp_section 24 24 30
     print_three_columns endpoint_section agent_section method_section 44 36 22
     print_three_columns status_section status_path_section protection_section 24 40 34
     print_three_columns scanner_section error_section alert_section 36 36 36
@@ -454,17 +523,23 @@ parse_ufw_snapshot_line() {
 parse_ss_snapshot_line() {
     local line="$1"
     local out_name="$2"
+    local state_counts_name="$3"
     declare -n out="$out_name"
-    local peer ip
+    declare -n state_counts="$state_counts_name"
+    local state peer ip key
 
     [[ -z "$line" ]] && return
     [[ "$line" == State* || "$line" == Recv-Q* ]] && return
 
+    state=$(awk '{print $1}' <<<"$line")
     peer=$(awk '{print $NF}' <<<"$line")
     ip=$(parse_socket_ip "$peer")
 
-    [[ -z "$ip" ]] && return
-    ((out["$ip"]++))
+    [[ -z "$ip" || -z "$state" ]] && return
+
+    key="${ip}|${state}"
+    ((out["$key"]++))
+    ((state_counts["$state"]++))
 }
 
 parse_uptime_snapshot_line() {
@@ -498,7 +573,7 @@ parse_nginx_fd_snapshot_line() {
     local out_name="$2"
     declare -n out="$out_name"
 
-    if [[ "$line" =~ fds=([0-9]+) ]]; then
+    if [[ "$line" =~ fds=([^[:space:]]+) ]]; then
         out="${BASH_REMATCH[1]}"
     fi
 }
@@ -541,12 +616,18 @@ apply_snapshot_buffer() {
     local line
     local new_load="$SYSTEM_LOAD_AVG"
     local new_mem="$SYSTEM_MEMORY_USAGE"
-    local new_nginx_open_fds="$NGINX_OPEN_FDS"
-    local new_active_jails="$FAIL2BAN_ACTIVE_JAILS"
-    local new_current_bans=0
-    local new_total_bans=0
+    local new_nginx_open_fds="n/a"
+    local new_active_jails="n/a"
+    local new_current_bans="n/a"
+    local new_total_bans="n/a"
+    local new_current_bans_count=0
+    local new_total_bans_count=0
+    local nginx_fd_seen=0
+    local fail2ban_top_seen=0
+    local fail2ban_jail_stats_seen=0
     local -a new_ufw_rules=()
     local -A new_live_connection_counts=()
+    local -A new_live_connection_state_counts=()
     local -A new_fail2ban_current_bans_by_jail=()
 
     for line in "${snapshot_buffer[@]}"; do
@@ -560,7 +641,7 @@ apply_snapshot_buffer() {
                 parse_ufw_snapshot_line "$line" new_ufw_rules
                 ;;
             SS)
-                parse_ss_snapshot_line "$line" new_live_connection_counts
+                parse_ss_snapshot_line "$line" new_live_connection_counts new_live_connection_state_counts
                 ;;
             UPTIME)
                 parse_uptime_snapshot_line "$line" new_load
@@ -569,22 +650,49 @@ apply_snapshot_buffer() {
                 parse_free_snapshot_line "$line" new_mem
                 ;;
             NGINXFD)
+                [[ "$line" =~ fds=([^[:space:]]+) ]] && nginx_fd_seen=1
                 parse_nginx_fd_snapshot_line "$line" new_nginx_open_fds
                 ;;
             F2BTOP)
+                [[ "$line" =~ Number\ of\ jail:[[:space:]]*([0-9]+) ]] && fail2ban_top_seen=1
                 parse_fail2ban_top_line "$line" new_active_jails
                 ;;
             JAIL:*)
                 jail="${current_section#JAIL:}"
-                parse_fail2ban_jail_line "$jail" "$line" new_fail2ban_current_bans_by_jail new_current_bans new_total_bans
+                if [[ "$line" =~ (Currently|Total)\ banned:[[:space:]]*([0-9]+) ]]; then
+                    fail2ban_jail_stats_seen=1
+                fi
+                parse_fail2ban_jail_line "$jail" "$line" new_fail2ban_current_bans_by_jail new_current_bans_count new_total_bans_count
                 ;;
         esac
     done
+
+    if (( fail2ban_top_seen == 1 )); then
+        if [[ "$new_active_jails" == "0" ]]; then
+            new_current_bans=0
+            new_total_bans=0
+        elif (( fail2ban_jail_stats_seen == 0 )); then
+            new_current_bans="n/a"
+            new_total_bans="n/a"
+        else
+            new_current_bans="$new_current_bans_count"
+            new_total_bans="$new_total_bans_count"
+        fi
+    fi
+
+    if (( nginx_fd_seen == 0 )); then
+        new_nginx_open_fds="n/a"
+    fi
 
     ufw_rules=("${new_ufw_rules[@]}")
     live_connection_counts=()
     for line in "${!new_live_connection_counts[@]}"; do
         live_connection_counts["$line"]="${new_live_connection_counts[$line]}"
+    done
+
+    live_connection_state_counts=()
+    for line in "${!new_live_connection_state_counts[@]}"; do
+        live_connection_state_counts["$line"]="${new_live_connection_state_counts[$line]}"
     done
 
     fail2ban_current_bans_by_jail=()
@@ -698,6 +806,11 @@ process_tagged_line() {
 
 build_snapshot_remote_command() {
     local command=""
+    local fail2ban_client_cmd="fail2ban-client"
+
+    if [[ -n "$FAIL2BAN_CLIENT_PREFIX" ]]; then
+        fail2ban_client_cmd="${FAIL2BAN_CLIENT_PREFIX} fail2ban-client"
+    fi
 
     command+="export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH\"; "
     command+="printf '__SNAPSHOT_BEGIN__\n'; "
@@ -707,20 +820,20 @@ build_snapshot_remote_command() {
     fi
 
     if (( ENABLE_SS == 1 )); then
-        command+="printf '__SECTION__:SS\n'; ss -tn state established 2>/dev/null || true; "
+        command+="printf '__SECTION__:SS\n'; ss -tn 2>/dev/null || true; "
     fi
 
     if (( ENABLE_SYSTEM_METRICS == 1 )); then
         command+="printf '__SECTION__:UPTIME\n'; uptime 2>/dev/null || true; "
         command+="printf '__SECTION__:FREE\n'; free -m 2>/dev/null || true; "
-        command+="printf '__SECTION__:NGINXFD\n'; pid=\$(pgrep -o nginx 2>/dev/null || true); if [ -n \"\$pid\" ]; then printf 'pid=%s fds=%s\n' \"\$pid\" \"\$(ls -1 /proc/\$pid/fd 2>/dev/null | wc -l)\"; else printf 'pid=none fds=0\n'; fi; "
+        command+="printf '__SECTION__:NGINXFD\n'; pid=\$(pgrep -o nginx 2>/dev/null || true); if [ -z \"\$pid\" ]; then printf 'pid=none fds=n/a\n'; elif ls -1 \"/proc/\$pid/fd\" >/dev/null 2>&1; then printf 'pid=%s fds=%s\n' \"\$pid\" \"\$(ls -1 /proc/\$pid/fd 2>/dev/null | wc -l)\"; else printf 'pid=%s fds=n/a\n' \"\$pid\"; fi; "
     fi
 
     if (( ENABLE_FAIL2BAN_STATUS == 1 )); then
-        command+="printf '__SECTION__:F2BTOP\n'; fail2ban-client status 2>/dev/null || true; "
-        command+="for jail in \$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do "
+        command+="printf '__SECTION__:F2BTOP\n'; ${fail2ban_client_cmd} status 2>/dev/null || true; "
+        command+="for jail in \$(${fail2ban_client_cmd} status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do "
         command+="printf '__SECTION__:JAIL:%s\n' \"\$jail\"; "
-        command+="fail2ban-client status \"\$jail\" 2>/dev/null || true; "
+        command+="${fail2ban_client_cmd} status \"\$jail\" 2>/dev/null || true; "
         command+="done; "
     fi
 
