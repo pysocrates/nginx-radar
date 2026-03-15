@@ -38,6 +38,7 @@ declare -A fail2ban_jail_counts=()
 declare -A fail2ban_ip_counts=()
 declare -A live_connection_counts=()
 declare -A live_connection_state_counts=()
+declare -A live_connection_flow_counts=()
 declare -A error_signal_counts=()
 declare -A fail2ban_current_bans_by_jail=()
 declare -a scanner_events=()
@@ -56,7 +57,7 @@ response_size_total=0
 response_size_samples=0
 tls_handshake_error_count=0
 REFRESH_SECONDS="${REFRESH_SECONDS:-2}"
-TOP_N="${TOP_N:-10}"
+TOP_N="${TOP_N:-5}"
 BURST_WINDOW_SECONDS="${BURST_WINDOW_SECONDS:-2}"
 BURST_THRESHOLD="${BURST_THRESHOLD:-10}"
 SNAPSHOT_POLL_SECONDS="${SNAPSHOT_POLL_SECONDS:-15}"
@@ -68,6 +69,7 @@ ENABLE_SYSTEM_METRICS="${ENABLE_SYSTEM_METRICS:-1}"
 ENABLE_FAIL2BAN_STATUS="${ENABLE_FAIL2BAN_STATUS:-1}"
 FAIL2BAN_CLIENT_PREFIX="${FAIL2BAN_CLIENT_PREFIX:-}"
 NGINX_FD_PREFIX="${NGINX_FD_PREFIX:-}"
+UFW_PREFIX="${UFW_PREFIX:-}"
 SYSTEM_LOAD_AVG="n/a"
 SYSTEM_MEMORY_USAGE="n/a"
 FAIL2BAN_ACTIVE_JAILS=0
@@ -77,6 +79,10 @@ SNAPSHOT_COLLECTING=0
 SNAPSHOT_LAST_APPLIED="never"
 SSH_KEY_PATH=""
 NGINX_OPEN_FDS="n/a"
+SCREEN_INITIALIZED=0
+CURSOR_HIDDEN=0
+WRAP_DISABLED=0
+RESIZE_PENDING=0
 declare -a SSH_ARGS=()
 
 expand_path() {
@@ -161,30 +167,177 @@ fit_cell() {
     fi
 }
 
-print_three_columns() {
+repeat_char() {
+    local char="$1"
+    local count="$2"
+    local result=""
+
+    (( count < 0 )) && count=0
+
+    while (( count > 0 )); do
+        result+="$char"
+        ((count--))
+    done
+
+    printf '%s' "$result"
+}
+
+render_box() {
+    local source_name="$1"
+    local width="$2"
+    local out_name="$3"
+    declare -n source="$source_name"
+    declare -n out="$out_name"
+    local title filler line
+
+    title="${source[0]-}"
+    filler=$(repeat_char "-" "$(( width - ${#title} - 3 ))")
+
+    out=("+- ${title} ${filler}+")
+
+    for line in "${source[@]:1}"; do
+        out+=("| $(fit_cell "$line" "$width") |")
+    done
+
+    out+=("+$(repeat_char "-" "$(( width + 2 ))")+")
+}
+
+print_box_row() {
     local left_name="$1"
     local center_name="$2"
     local right_name="$3"
-    local left_width="$4"
-    local center_width="$5"
-    local right_width="$6"
     declare -n left="$left_name"
     declare -n center="$center_name"
     declare -n right="$right_name"
     local max_lines=0
     local i
+    local left_blank center_blank right_blank
 
     (( ${#left[@]} > max_lines )) && max_lines=${#left[@]}
     (( ${#center[@]} > max_lines )) && max_lines=${#center[@]}
     (( ${#right[@]} > max_lines )) && max_lines=${#right[@]}
+    left_blank=$(printf '%*s' "${#left[0]}" '')
+    center_blank=$(printf '%*s' "${#center[0]}" '')
+    right_blank=$(printf '%*s' "${#right[0]}" '')
 
     for (( i=0; i<max_lines; i++ )); do
-        printf '%s | %s | %s\n' \
-            "$(fit_cell "${left[i]-}" "$left_width")" \
-            "$(fit_cell "${center[i]-}" "$center_width")" \
-            "$(fit_cell "${right[i]-}" "$right_width")"
+        printf '%s  %s  %s\n' \
+            "${left[i]-$left_blank}" \
+            "${center[i]-$center_blank}" \
+            "${right[i]-$right_blank}"
     done
     printf '\n'
+}
+
+print_two_box_row() {
+    local left_name="$1"
+    local right_name="$2"
+    declare -n left="$left_name"
+    declare -n right="$right_name"
+    local max_lines=0
+    local i
+    local left_blank right_blank
+
+    (( ${#left[@]} > max_lines )) && max_lines=${#left[@]}
+    (( ${#right[@]} > max_lines )) && max_lines=${#right[@]}
+    left_blank=$(printf '%*s' "${#left[0]}" '')
+    right_blank=$(printf '%*s' "${#right[0]}" '')
+
+    for (( i=0; i<max_lines; i++ )); do
+        printf '%s  %s\n' \
+            "${left[i]-$left_blank}" \
+            "${right[i]-$right_blank}"
+    done
+    printf '\n'
+}
+
+build_overview_section() {
+    local out_name="$1"
+    local rpm="$2"
+    local new_ips="$3"
+    local avg_size="$4"
+    declare -n out="$out_name"
+
+    out=(
+        "Overview"
+        "Server: $SERVER"
+        "Rate: $rpm req/min | New IPs/m: $new_ips | Avg bytes: $avg_size | TLS errs: $tls_handshake_error_count"
+        "Load: $SYSTEM_LOAD_AVG | Mem: $SYSTEM_MEMORY_USAGE | nginx fd: $NGINX_OPEN_FDS | UFW deny: ${#ufw_rules[@]} | F2B current: $FAIL2BAN_CURRENT_BANS"
+        "Snapshot: $SNAPSHOT_LAST_APPLIED | Updated: $(date '+%Y-%m-%d %H:%M:%S')"
+        "Access: $LOG ($NGINX_LINES_PROCESSED) | Error: $ERROR_LOG ($ERROR_LINES_PROCESSED) | Fail2Ban: $FAIL2BAN_LOG ($FAIL2BAN_LINES_PROCESSED)"
+    )
+}
+
+current_terminal_columns() {
+    local cols
+
+    cols=$(tput cols 2>/dev/null || printf '%s' "${COLUMNS:-120}")
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=120
+    (( cols < 40 )) && cols=40
+    printf '%s\n' "$cols"
+}
+
+current_terminal_lines() {
+    local lines
+
+    lines=$(tput lines 2>/dev/null || printf '%s' "${LINES:-40}")
+    [[ "$lines" =~ ^[0-9]+$ ]] || lines=40
+    (( lines < 12 )) && lines=12
+    printf '%s\n' "$lines"
+}
+
+split_three_widths() {
+    local total="$1"
+    local first_name="$2"
+    local second_name="$3"
+    local third_name="$4"
+    local weight1="$5"
+    local weight2="$6"
+    local weight3="$7"
+    declare -n first="$first_name"
+    declare -n second="$second_name"
+    declare -n third="$third_name"
+    local weight_sum=$(( weight1 + weight2 + weight3 ))
+
+    first=$(( total * weight1 / weight_sum ))
+    second=$(( total * weight2 / weight_sum ))
+    third=$(( total - first - second ))
+}
+
+clip_dashboard_height() {
+    local text="$1"
+    local max_lines="$2"
+    local notice="... truncated; enlarge terminal or reduce TOP_N"
+    local -a lines=()
+
+    mapfile -t lines <<<"$text"
+
+    if (( ${#lines[@]} <= max_lines )); then
+        printf '%s' "$text"
+        return
+    fi
+
+    if (( max_lines <= 1 )); then
+        printf '%s' "$notice"
+        return
+    fi
+
+    lines=("${lines[@]:0:max_lines-1}")
+    lines+=("$notice")
+    printf '%s\n' "${lines[@]}"
+}
+
+normalize_dashboard_width() {
+    local text="$1"
+    local width="$2"
+    local -a lines=()
+    local line
+
+    mapfile -t lines <<<"$text"
+
+    for line in "${lines[@]}"; do
+        printf '%s\n' "$(fit_cell "$line" "$width")"
+    done
 }
 
 build_ranked_section() {
@@ -229,7 +382,7 @@ build_status_section() {
     local key value
 
     out=(
-        "Traffic + Errors"
+        "Traffic Summary"
         "$(printf '%-14s %6s' "Metric" "Value")"
         "$(printf '%-14s %6s' "req/min" "$rpm")"
         "$(printf '%-14s %6s' "new ips/m" "$new_ips")"
@@ -301,7 +454,7 @@ build_protection_section() {
     local displayed=0
 
     out=(
-        "Protection"
+        "Protection + F2B"
         "$(printf '%-16s %5s' "Signal" "Value")"
         "$(printf '%-16s %5s' "UFW deny" "${#ufw_rules[@]}")"
         "$(printf '%-16s %5s' "F2B jails" "$FAIL2BAN_ACTIVE_JAILS")"
@@ -384,7 +537,7 @@ build_live_tcp_section() {
     local key value ip state shown=0
 
     out=(
-        "Live TCP"
+        "TCP Snapshot"
     )
 
     if (( ${#live_connection_counts[@]} == 0 )); then
@@ -427,13 +580,66 @@ build_live_tcp_section() {
     done <<<"$connection_rows"
 }
 
+build_connection_flow_section() {
+    local out_name="$1"
+    declare -n out="$out_name"
+    local rows
+    local key value local_endpoint peer_endpoint state
+
+    out=(
+        "Connection Paths"
+        "$(printf '%-30s %-30s %-7s %4s' "Source" "Destination" "State" "Cnt")"
+    )
+
+    if (( ${#live_connection_flow_counts[@]} == 0 )); then
+        out+=("waiting for data")
+        return
+    fi
+
+    rows=$(
+        for key in "${!live_connection_flow_counts[@]}"; do
+            printf '%s\t%s\n' "$key" "${live_connection_flow_counts[$key]}"
+        done | LC_ALL=C sort -t $'\t' -k2,2nr -k1,1 | head -n "$TOP_N"
+    )
+
+    while IFS=$'\t' read -r key value; do
+        [[ -z "${key:-}" ]] && continue
+        local_endpoint="${key%%|*}"
+        key="${key#*|}"
+        peer_endpoint="${key%%|*}"
+        state="${key#*|}"
+        out+=("$(printf '%-30s %-30s %-7s %4s' "$local_endpoint" "$peer_endpoint" "$(shorten_tcp_state "$state")" "$value")")
+    done <<<"$rows"
+}
+
 render_dashboard() {
     local rpm
     local new_ips
     local avg_size
+    local dashboard
+    local terminal_cols
+    local terminal_lines
+    local overview_width
+    local summary_row_total
+    local summary_left_width
+    local summary_center_width
+    local summary_right_width
+    local source_row_total
+    local source_left_width
+    local source_center_width
+    local source_right_width
+    local events_row_total
+    local events_left_width
+    local events_center_width
+    local events_right_width
+    local detail_row_total
+    local detail_left_width
+    local detail_right_width
+    local -a overview_section=()
     local -a ip_section=()
     local -a network_section=()
     local -a live_tcp_section=()
+    local -a connection_flow_section=()
     local -a endpoint_section=()
     local -a agent_section=()
     local -a method_section=()
@@ -443,14 +649,70 @@ render_dashboard() {
     local -a scanner_section=()
     local -a error_section=()
     local -a alert_section=()
+    local -a overview_box=()
+    local -a status_box=()
+    local -a protection_box=()
+    local -a tcp_box=()
+    local -a connection_flow_box=()
+    local -a ip_box=()
+    local -a network_box=()
+    local -a endpoint_box=()
+    local -a agent_box=()
+    local -a method_box=()
+    local -a status_path_box=()
+    local -a alert_box=()
+    local -a scanner_box=()
+    local -a error_box=()
 
     rpm=$(current_request_rate)
     new_ips=$(current_new_ip_rate)
     avg_size=$(current_average_response_size)
+    terminal_cols=$(current_terminal_columns)
+    terminal_lines=$(current_terminal_lines)
+    overview_width=$(( terminal_cols - 4 ))
+    summary_row_total=$(( terminal_cols - 16 ))
+    split_three_widths "$summary_row_total" summary_left_width summary_center_width summary_right_width 24 30 30
+    source_row_total=$(( terminal_cols - 16 ))
+    split_three_widths "$source_row_total" source_left_width source_center_width source_right_width 24 24 36
+    events_row_total=$(( terminal_cols - 16 ))
+    split_three_widths "$events_row_total" events_left_width events_center_width events_right_width 28 28 28
+    detail_row_total=$(( terminal_cols - 10 ))
+    detail_left_width=$(( detail_row_total * 1 / 3 ))
+    detail_right_width=$(( detail_row_total - detail_left_width ))
 
+    if (( terminal_cols < 60 )); then
+        dashboard=$(
+            printf 'NGINX RADAR\n'
+            printf '====================================\n'
+            printf 'Terminal too narrow (%s cols)\n' "$terminal_cols"
+            printf 'Widen the window to at least 60 columns.\n'
+            printf 'Snapshot: %s\n' "$SNAPSHOT_LAST_APPLIED"
+        )
+        dashboard=$(clip_dashboard_height "$dashboard" "$(( terminal_lines - 1 ))")
+
+        if [[ -t 1 ]]; then
+            if (( SCREEN_INITIALIZED == 0 || RESIZE_PENDING == 1 )); then
+                printf '\033[?25l\033[?7l\033[H\033[2J'
+                SCREEN_INITIALIZED=1
+                CURSOR_HIDDEN=1
+                WRAP_DISABLED=1
+                RESIZE_PENDING=0
+            else
+                printf '\033[H'
+            fi
+            printf '%s' "$dashboard"
+            printf '\033[J'
+        else
+            printf '%s' "$dashboard"
+        fi
+        return
+    fi
+
+    build_overview_section overview_section "$rpm" "$new_ips" "$avg_size"
     build_ranked_section ip_section "Top IPs" ip_counts "$TOP_N" "$(printf '%-15s %6s' "IP" "Hits")" '%-15s %6s' "waiting for data"
     build_ranked_section network_section "Top Networks" network_counts "$TOP_N" "$(printf '%-16s %5s' "/24" "Hits")" '%-16s %5s' "waiting for data"
     build_live_tcp_section live_tcp_section
+    build_connection_flow_section connection_flow_section
     build_ranked_section endpoint_section "Top Endpoints" endpoint_counts "$TOP_N" "$(printf '%-36s %6s' "Path" "Hits")" '%-36s %6s' "waiting for data"
     build_ranked_section agent_section "Top Agents" user_agent_counts "$TOP_N" "$(printf '%-28s %6s' "Agent" "Hits")" '%-28s %6s' "waiting for data"
     build_method_section method_section
@@ -460,27 +722,60 @@ render_dashboard() {
     build_recent_section scanner_section "Recent Scanners" scanner_events "none"
     build_recent_section error_section "Recent Error Log" error_events "none"
     build_recent_section alert_section "Recent Alerts" alert_events "none"
+    render_box overview_section "$overview_width" overview_box
+    render_box status_section "$summary_left_width" status_box
+    render_box protection_section "$summary_center_width" protection_box
+    render_box live_tcp_section "$summary_right_width" tcp_box
+    render_box connection_flow_section "$overview_width" connection_flow_box
+    render_box ip_section "$source_left_width" ip_box
+    render_box network_section "$source_center_width" network_box
+    render_box agent_section "$source_right_width" agent_box
+    render_box endpoint_section "$overview_width" endpoint_box
+    render_box method_section "$detail_left_width" method_box
+    render_box status_path_section "$detail_right_width" status_path_box
+    render_box alert_section "$events_left_width" alert_box
+    render_box scanner_section "$events_center_width" scanner_box
+    render_box error_section "$events_right_width" error_box
+
+    dashboard=$(
+        printf 'NGINX RADAR\n'
+        printf '====================================\n'
+        printf '%s\n' "${overview_box[@]}"
+        printf '\n'
+        print_box_row status_box protection_box tcp_box
+        printf '\n'
+        printf '%s\n' "${endpoint_box[@]}"
+        printf '\n'
+        print_box_row ip_box network_box agent_box
+        printf '\n'
+        print_two_box_row method_box status_path_box
+        printf '\n'
+        print_box_row alert_box scanner_box error_box
+        printf '\n'
+        printf '%s\n' "${connection_flow_box[@]}"
+    )
+    dashboard=$(clip_dashboard_height "$dashboard" "$(( terminal_lines - 1 ))")
+    dashboard=$(normalize_dashboard_width "$dashboard" "$terminal_cols")
 
     if [[ -t 1 ]]; then
-        clear
+        if (( SCREEN_INITIALIZED == 0 || RESIZE_PENDING == 1 )); then
+            printf '\033[?25l\033[?7l\033[H\033[2J'
+            SCREEN_INITIALIZED=1
+            CURSOR_HIDDEN=1
+            WRAP_DISABLED=1
+            RESIZE_PENDING=0
+        else
+            printf '\033[H'
+        fi
+        printf '%s' "$dashboard"
+        printf '\033[J'
+    else
+        printf '%s' "$dashboard"
     fi
+}
 
-    printf 'NGINX RADAR\n'
-    printf '====================================\n'
-    printf 'Server: %s\n' "$SERVER"
-    printf 'Rate: %s req/min | New IPs/m: %s | Avg bytes: %s | TLS errs: %s\n' \
-        "$rpm" "$new_ips" "$avg_size" "$tls_handshake_error_count"
-    printf 'Load: %s | Mem: %s | nginx fd: %s | UFW deny: %s | F2B current bans: %s\n' \
-        "$SYSTEM_LOAD_AVG" "$SYSTEM_MEMORY_USAGE" "$NGINX_OPEN_FDS" "${#ufw_rules[@]}" "$FAIL2BAN_CURRENT_BANS"
-    printf 'Snapshot: %s\n' "$SNAPSHOT_LAST_APPLIED"
-    printf 'Access: %s (%s) | Error: %s (%s) | Fail2Ban log: %s (%s)\n' \
-        "$LOG" "$NGINX_LINES_PROCESSED" "$ERROR_LOG" "$ERROR_LINES_PROCESSED" "$FAIL2BAN_LOG" "$FAIL2BAN_LINES_PROCESSED"
-    printf 'Updated: %s\n\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-
-    print_three_columns ip_section network_section live_tcp_section 24 24 30
-    print_three_columns endpoint_section agent_section method_section 44 36 22
-    print_three_columns status_section status_path_section protection_section 24 40 34
-    print_three_columns scanner_section error_section alert_section 36 36 36
+on_winch() {
+    RESIZE_PENDING=1
 }
 
 parse_socket_ip() {
@@ -505,19 +800,20 @@ parse_ufw_snapshot_line() {
     local line="$1"
     local out_name="$2"
     declare -n out="$out_name"
-    local rule rest to from
+    local cleaned rule to from
 
-    [[ "$line" == *"DENY IN"* ]] || return
-    [[ "$line" == \[* ]] || return
+    cleaned=$(sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' <<<"$line")
+    cleaned=$(trim_text "$cleaned")
 
-    rule="${line%%]*}"
-    rule="${rule#[}"
-    rule="${rule// /}"
-    rest="${line#*] }"
-    to=$(trim_text "${rest%%DENY IN*}")
-    from=$(trim_text "${rest#*DENY IN }")
+    if [[ "$cleaned" =~ ^\[[[:space:]]*([0-9]+)\][[:space:]]*(.+)[[:space:]]+((DENY|REJECT)([[:space:]]+(IN|OUT))?)[[:space:]]+(.+)$ ]]; then
+        rule="${BASH_REMATCH[1]}"
+        to=$(trim_text "${BASH_REMATCH[2]}")
+        from=$(trim_text "${BASH_REMATCH[7]}")
+    else
+        return
+    fi
 
-    [[ -z "$from" ]] && return
+    [[ -z "$to" || -z "$from" ]] && return
     out+=("$(printf '#%-3s %-18s %s' "$rule" "$from" "$to")")
 }
 
@@ -525,22 +821,27 @@ parse_ss_snapshot_line() {
     local line="$1"
     local out_name="$2"
     local state_counts_name="$3"
+    local flow_counts_name="$4"
     declare -n out="$out_name"
     declare -n state_counts="$state_counts_name"
-    local state peer ip key
+    declare -n flow_counts="$flow_counts_name"
+    local state local_endpoint peer_endpoint ip key flow_key
 
     [[ -z "$line" ]] && return
     [[ "$line" == State* || "$line" == Recv-Q* ]] && return
 
     state=$(awk '{print $1}' <<<"$line")
-    peer=$(awk '{print $NF}' <<<"$line")
-    ip=$(parse_socket_ip "$peer")
+    local_endpoint=$(awk '{print $(NF-1)}' <<<"$line")
+    peer_endpoint=$(awk '{print $NF}' <<<"$line")
+    ip=$(parse_socket_ip "$peer_endpoint")
 
-    [[ -z "$ip" || -z "$state" ]] && return
+    [[ -z "$ip" || -z "$state" || -z "$local_endpoint" || -z "$peer_endpoint" ]] && return
 
     key="${ip}|${state}"
+    flow_key="${local_endpoint}|${peer_endpoint}|${state}"
     ((out["$key"]++))
     ((state_counts["$state"]++))
+    ((flow_counts["$flow_key"]++))
 }
 
 parse_uptime_snapshot_line() {
@@ -629,6 +930,7 @@ apply_snapshot_buffer() {
     local -a new_ufw_rules=()
     local -A new_live_connection_counts=()
     local -A new_live_connection_state_counts=()
+    local -A new_live_connection_flow_counts=()
     local -A new_fail2ban_current_bans_by_jail=()
 
     for line in "${snapshot_buffer[@]}"; do
@@ -642,7 +944,7 @@ apply_snapshot_buffer() {
                 parse_ufw_snapshot_line "$line" new_ufw_rules
                 ;;
             SS)
-                parse_ss_snapshot_line "$line" new_live_connection_counts new_live_connection_state_counts
+                parse_ss_snapshot_line "$line" new_live_connection_counts new_live_connection_state_counts new_live_connection_flow_counts
                 ;;
             UPTIME)
                 parse_uptime_snapshot_line "$line" new_load
@@ -694,6 +996,11 @@ apply_snapshot_buffer() {
     live_connection_state_counts=()
     for line in "${!new_live_connection_state_counts[@]}"; do
         live_connection_state_counts["$line"]="${new_live_connection_state_counts[$line]}"
+    done
+
+    live_connection_flow_counts=()
+    for line in "${!new_live_connection_flow_counts[@]}"; do
+        live_connection_flow_counts["$line"]="${new_live_connection_flow_counts[$line]}"
     done
 
     fail2ban_current_bans_by_jail=()
@@ -809,6 +1116,7 @@ build_snapshot_remote_command() {
     local command=""
     local fail2ban_client_cmd="fail2ban-client"
     local nginx_fd_count_cmd='ls -1 "/proc/$pid/fd" 2>/dev/null | wc -l'
+    local ufw_cmd="ufw"
 
     if [[ -n "$FAIL2BAN_CLIENT_PREFIX" ]]; then
         fail2ban_client_cmd="${FAIL2BAN_CLIENT_PREFIX} fail2ban-client"
@@ -818,11 +1126,15 @@ build_snapshot_remote_command() {
         nginx_fd_count_cmd="${NGINX_FD_PREFIX} sh -c 'ls -1 \"/proc/\$1/fd\" 2>/dev/null | wc -l' sh \"\$pid\""
     fi
 
+    if [[ -n "$UFW_PREFIX" ]]; then
+        ufw_cmd="${UFW_PREFIX} ufw"
+    fi
+
     command+="export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH\"; "
     command+="printf '__SNAPSHOT_BEGIN__\n'; "
 
     if (( ENABLE_UFW == 1 )); then
-        command+="printf '__SECTION__:UFW\n'; ufw status numbered 2>/dev/null || true; "
+        command+="printf '__SECTION__:UFW\n'; ${ufw_cmd} status numbered 2>/dev/null || true; "
     fi
 
     if (( ENABLE_SS == 1 )); then
@@ -912,6 +1224,12 @@ start_streams() {
 
 on_exit() {
     cleanup
+    if [[ -t 1 && "$CURSOR_HIDDEN" == 1 ]]; then
+        printf '\033[?25h'
+    fi
+    if [[ -t 1 && "$WRAP_DISABLED" == 1 ]]; then
+        printf '\033[?7h'
+    fi
     printf '\nStopping nginx-radar\n'
 }
 
@@ -923,6 +1241,7 @@ main() {
 
     trap on_exit EXIT
     trap 'exit 0' INT TERM
+    trap on_winch WINCH
 
     if [[ "${1:-}" == "--stdin" ]]; then
         last_render=$(date +%s)

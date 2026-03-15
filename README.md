@@ -9,6 +9,7 @@ Nothing is installed on the server. The tool runs locally and executes ordinary 
 
 - top IPs and `/24` networks
 - top endpoints and user agents
+- live TCP peer counts plus full connection source/destination paths
 - request rate, new IP rate, and average response size
 - status code totals and top 4xx/5xx paths
 - suspicious probe hits like `.php`, `/.env`, and `/wp-admin`
@@ -48,6 +49,7 @@ ERROR_LOG="/var/log/nginx/error.log"
 FAIL2BAN_LOG="/var/log/fail2ban.log"
 FAIL2BAN_CLIENT_PREFIX=""
 NGINX_FD_PREFIX=""
+UFW_PREFIX=""
 ```
 
 Then run:
@@ -73,8 +75,9 @@ Most useful settings:
 - `FAIL2BAN_LOG`: Fail2Ban log path
 - `FAIL2BAN_CLIENT_PREFIX`: optional prefix for `fail2ban-client`, for example `sudo -n`
 - `NGINX_FD_PREFIX`: optional prefix for nginx fd inspection, for example `sudo -n`
+- `UFW_PREFIX`: optional prefix for `ufw`, for example `sudo -n`
 - `REFRESH_SECONDS`: dashboard redraw interval
-- `TOP_N`: number of top rows to show per ranked panel
+- `TOP_N`: number of top rows to show per ranked panel, default `5`
 - `BURST_WINDOW_SECONDS`: short burst window
 - `BURST_THRESHOLD`: request count threshold for burst alerts
 
@@ -102,6 +105,14 @@ NGINX_FD_PREFIX="sudo -n"
 ```
 
 That lets the snapshot count `/proc/<nginx-pid>/fd` without changing the rest of the metric collection.
+
+If `ufw status numbered` needs sudo, set:
+
+```bash
+UFW_PREFIX="sudo -n"
+```
+
+That allows the dashboard to read numbered UFW rules without prompting.
 
 ## Remote Commands
 
@@ -186,6 +197,12 @@ Panels stay empty for UFW, Fail2Ban, or metrics
 
 - the remote host may not have those tools
 - set the matching `ENABLE_*` toggle to `0`
+
+`UFW deny` shows `0` even though `ufw status numbered` has active rules
+
+- the remote `ufw status numbered` command may require sudo
+- set `UFW_PREFIX="sudo -n"` in `config.env`
+- confirm your SSH user has passwordless sudo for `ufw`
 
 Permission denied on logs
 
