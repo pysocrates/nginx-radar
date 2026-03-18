@@ -10,6 +10,7 @@ Nothing is installed on the server. The tool runs locally and executes ordinary 
 - top IPs and `/24` networks
 - top endpoints and user agents
 - live TCP peer counts plus full connection source/destination paths
+- per-process memory watch plus python thread and gunicorn process counts
 - request rate, new IP rate, and average response size
 - status code totals and top 4xx/5xx paths
 - suspicious probe hits like `.php`, `/.env`, and `/wp-admin`
@@ -28,6 +29,7 @@ Optional remote commands used by the extra panels:
 - `ss`
 - `uptime`
 - `free`
+- `ps`
 - `fail2ban-client`
 
 If those are missing, disable the related toggles in `config.env`.
@@ -50,6 +52,7 @@ FAIL2BAN_LOG="/var/log/fail2ban.log"
 FAIL2BAN_CLIENT_PREFIX=""
 NGINX_FD_PREFIX=""
 UFW_PREFIX=""
+PS_PREFIX=""
 ```
 
 Then run:
@@ -76,6 +79,7 @@ Most useful settings:
 - `FAIL2BAN_CLIENT_PREFIX`: optional prefix for `fail2ban-client`, for example `sudo -n`
 - `NGINX_FD_PREFIX`: optional prefix for nginx fd inspection, for example `sudo -n`
 - `UFW_PREFIX`: optional prefix for `ufw`, for example `sudo -n`
+- `PS_PREFIX`: optional prefix for `ps`, for example `sudo -n`
 - `REFRESH_SECONDS`: dashboard redraw interval
 - `TOP_N`: number of top rows to show per ranked panel, default `5`
 - `BURST_WINDOW_SECONDS`: short burst window
@@ -87,7 +91,7 @@ Feature toggles:
 - `ENABLE_FAIL2BAN=0` if the host does not have Fail2Ban logs
 - `ENABLE_UFW=0` if the host does not use UFW
 - `ENABLE_SS=0` if you do not want live TCP connection counts
-- `ENABLE_SYSTEM_METRICS=0` if you do not want `uptime`, `free`, or nginx fd stats
+- `ENABLE_SYSTEM_METRICS=0` if you do not want `uptime`, `free`, `ps`, or nginx fd stats
 - `ENABLE_FAIL2BAN_STATUS=0` if `fail2ban-client` is unavailable
 
 If `fail2ban-client status` requires sudo on the server, set:
@@ -114,6 +118,14 @@ UFW_PREFIX="sudo -n"
 
 That allows the dashboard to read numbered UFW rules without prompting.
 
+If the process watch commands need sudo, set:
+
+```bash
+PS_PREFIX="sudo -n"
+```
+
+That allows the dashboard to read the `ps`-based memory, thread, and gunicorn counts without prompting.
+
 ## Remote Commands
 
 In normal remote mode, `nginx-radar` uses SSH to run commands such as:
@@ -125,6 +137,9 @@ In normal remote mode, `nginx-radar` uses SSH to run commands such as:
 - `ss -tn state established`
 - `uptime`
 - `free -m`
+- `ps aux --sort=-%mem | head -n 6`
+- `ps -eLf | awk '/python/ && $0 !~ /awk/ {count++} END {print count+0}'`
+- `ps -eo comm=,args= | awk '/gunicorn/ {count++} END {print count+0}'`
 - `fail2ban-client status`
 
 If your SSH user cannot read those logs directly, you have three practical options:

@@ -48,6 +48,7 @@ declare -a alert_events=()
 declare -a ufw_rules=()
 declare -a snapshot_buffer=()
 declare -a new_ip_events=()
+declare -a process_memory_rows=()
 
 request_timestamps=""
 NGINX_LINES_PROCESSED=0
@@ -70,6 +71,7 @@ ENABLE_FAIL2BAN_STATUS="${ENABLE_FAIL2BAN_STATUS:-1}"
 FAIL2BAN_CLIENT_PREFIX="${FAIL2BAN_CLIENT_PREFIX:-}"
 NGINX_FD_PREFIX="${NGINX_FD_PREFIX:-}"
 UFW_PREFIX="${UFW_PREFIX:-}"
+PS_PREFIX="${PS_PREFIX:-}"
 SYSTEM_LOAD_AVG="n/a"
 SYSTEM_MEMORY_USAGE="n/a"
 FAIL2BAN_ACTIVE_JAILS=0
@@ -79,6 +81,8 @@ SNAPSHOT_COLLECTING=0
 SNAPSHOT_LAST_APPLIED="never"
 SSH_KEY_PATH=""
 NGINX_OPEN_FDS="n/a"
+PYTHON_THREAD_COUNT="n/a"
+GUNICORN_PROCESS_COUNT="n/a"
 SCREEN_INITIALIZED=0
 CURSOR_HIDDEN=0
 WRAP_DISABLED=0
@@ -612,6 +616,44 @@ build_connection_flow_section() {
     done <<<"$rows"
 }
 
+format_rss_kb() {
+    local rss_kb="$1"
+
+    [[ "$rss_kb" =~ ^[0-9]+$ ]] || {
+        printf '%s\n' "$rss_kb"
+        return
+    }
+
+    if (( rss_kb >= 1048576 )); then
+        printf '%sG\n' "$(( (rss_kb + 524288) / 1048576 ))"
+    elif (( rss_kb >= 1024 )); then
+        printf '%sM\n' "$(( (rss_kb + 512) / 1024 ))"
+    else
+        printf '%sK\n' "$rss_kb"
+    fi
+}
+
+build_process_watch_section() {
+    local out_name="$1"
+    declare -n out="$out_name"
+    local row
+
+    out=(
+        "Process Watch"
+        "$(printf '%-16s %6s | %-17s %6s' "python threads" "$PYTHON_THREAD_COUNT" "gunicorn procs" "$GUNICORN_PROCESS_COUNT")"
+        "$(printf '%-8s %-5s %6s %s' "PID" "%MEM" "RSS" "Command")"
+    )
+
+    if (( ${#process_memory_rows[@]} == 0 )); then
+        out+=("waiting for data")
+        return
+    fi
+
+    for row in "${process_memory_rows[@]}"; do
+        out+=("$row")
+    done
+}
+
 render_dashboard() {
     local rpm
     local new_ips
@@ -639,6 +681,7 @@ render_dashboard() {
     local -a ip_section=()
     local -a network_section=()
     local -a live_tcp_section=()
+    local -a process_watch_section=()
     local -a connection_flow_section=()
     local -a endpoint_section=()
     local -a agent_section=()
@@ -653,6 +696,7 @@ render_dashboard() {
     local -a status_box=()
     local -a protection_box=()
     local -a tcp_box=()
+    local -a process_watch_box=()
     local -a connection_flow_box=()
     local -a ip_box=()
     local -a network_box=()
@@ -712,6 +756,7 @@ render_dashboard() {
     build_ranked_section ip_section "Top IPs" ip_counts "$TOP_N" "$(printf '%-15s %6s' "IP" "Hits")" '%-15s %6s' "waiting for data"
     build_ranked_section network_section "Top Networks" network_counts "$TOP_N" "$(printf '%-16s %5s' "/24" "Hits")" '%-16s %5s' "waiting for data"
     build_live_tcp_section live_tcp_section
+    build_process_watch_section process_watch_section
     build_connection_flow_section connection_flow_section
     build_ranked_section endpoint_section "Top Endpoints" endpoint_counts "$TOP_N" "$(printf '%-36s %6s' "Path" "Hits")" '%-36s %6s' "waiting for data"
     build_ranked_section agent_section "Top Agents" user_agent_counts "$TOP_N" "$(printf '%-28s %6s' "Agent" "Hits")" '%-28s %6s' "waiting for data"
@@ -726,6 +771,7 @@ render_dashboard() {
     render_box status_section "$summary_left_width" status_box
     render_box protection_section "$summary_center_width" protection_box
     render_box live_tcp_section "$summary_right_width" tcp_box
+    render_box process_watch_section "$overview_width" process_watch_box
     render_box connection_flow_section "$overview_width" connection_flow_box
     render_box ip_section "$source_left_width" ip_box
     render_box network_section "$source_center_width" network_box
@@ -751,6 +797,8 @@ render_dashboard() {
         print_two_box_row method_box status_path_box
         printf '\n'
         print_box_row alert_box scanner_box error_box
+        printf '\n'
+        printf '%s\n' "${process_watch_box[@]}"
         printf '\n'
         printf '%s\n' "${connection_flow_box[@]}"
     )
@@ -880,6 +928,41 @@ parse_nginx_fd_snapshot_line() {
     fi
 }
 
+parse_process_memory_snapshot_line() {
+    local line="$1"
+    local out_name="$2"
+    declare -n out="$out_name"
+    local user pid cpu mem vsz rss tty stat start time command
+
+    [[ -z "$line" || "$line" == USER* ]] && return
+
+    read -r user pid cpu mem vsz rss tty stat start time command <<<"$line"
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return
+    [[ -n "$command" ]] || command="(unknown)"
+    out+=("$(printf '%-8s %-5s %6s %s' "$pid" "$mem" "$(format_rss_kb "$rss")" "$command")")
+}
+
+parse_python_thread_snapshot_line() {
+    local line="$1"
+    local out_name="$2"
+    declare -n out="$out_name"
+
+    if [[ "$line" =~ threads=([0-9]+) ]]; then
+        out="${BASH_REMATCH[1]}"
+    fi
+}
+
+parse_gunicorn_snapshot_line() {
+    local line="$1"
+    local out_name="$2"
+    declare -n out="$out_name"
+
+    if [[ "$line" =~ workers=([0-9]+) ]]; then
+        out="${BASH_REMATCH[1]}"
+    fi
+}
+
 parse_fail2ban_top_line() {
     local line="$1"
     local out_name="$2"
@@ -919,6 +1002,8 @@ apply_snapshot_buffer() {
     local new_load="$SYSTEM_LOAD_AVG"
     local new_mem="$SYSTEM_MEMORY_USAGE"
     local new_nginx_open_fds="n/a"
+    local new_python_thread_count="n/a"
+    local new_gunicorn_process_count="n/a"
     local new_active_jails="n/a"
     local new_current_bans="n/a"
     local new_total_bans="n/a"
@@ -928,6 +1013,7 @@ apply_snapshot_buffer() {
     local fail2ban_top_seen=0
     local fail2ban_jail_stats_seen=0
     local -a new_ufw_rules=()
+    local -a new_process_memory_rows=()
     local -A new_live_connection_counts=()
     local -A new_live_connection_state_counts=()
     local -A new_live_connection_flow_counts=()
@@ -955,6 +1041,15 @@ apply_snapshot_buffer() {
             NGINXFD)
                 [[ "$line" =~ fds=([^[:space:]]+) ]] && nginx_fd_seen=1
                 parse_nginx_fd_snapshot_line "$line" new_nginx_open_fds
+                ;;
+            PSMEM)
+                parse_process_memory_snapshot_line "$line" new_process_memory_rows
+                ;;
+            PSTHREADS)
+                parse_python_thread_snapshot_line "$line" new_python_thread_count
+                ;;
+            GUNICORN)
+                parse_gunicorn_snapshot_line "$line" new_gunicorn_process_count
                 ;;
             F2BTOP)
                 [[ "$line" =~ Number\ of\ jail:[[:space:]]*([0-9]+) ]] && fail2ban_top_seen=1
@@ -988,6 +1083,7 @@ apply_snapshot_buffer() {
     fi
 
     ufw_rules=("${new_ufw_rules[@]}")
+    process_memory_rows=("${new_process_memory_rows[@]}")
     live_connection_counts=()
     for line in "${!new_live_connection_counts[@]}"; do
         live_connection_counts["$line"]="${new_live_connection_counts[$line]}"
@@ -1011,6 +1107,8 @@ apply_snapshot_buffer() {
     SYSTEM_LOAD_AVG="$new_load"
     SYSTEM_MEMORY_USAGE="$new_mem"
     NGINX_OPEN_FDS="$new_nginx_open_fds"
+    PYTHON_THREAD_COUNT="$new_python_thread_count"
+    GUNICORN_PROCESS_COUNT="$new_gunicorn_process_count"
     FAIL2BAN_ACTIVE_JAILS="$new_active_jails"
     FAIL2BAN_CURRENT_BANS="$new_current_bans"
     FAIL2BAN_TOTAL_BANS="$new_total_bans"
@@ -1117,6 +1215,7 @@ build_snapshot_remote_command() {
     local fail2ban_client_cmd="fail2ban-client"
     local nginx_fd_count_cmd='ls -1 "/proc/$pid/fd" 2>/dev/null | wc -l'
     local ufw_cmd="ufw"
+    local ps_cmd="ps"
 
     if [[ -n "$FAIL2BAN_CLIENT_PREFIX" ]]; then
         fail2ban_client_cmd="${FAIL2BAN_CLIENT_PREFIX} fail2ban-client"
@@ -1128,6 +1227,10 @@ build_snapshot_remote_command() {
 
     if [[ -n "$UFW_PREFIX" ]]; then
         ufw_cmd="${UFW_PREFIX} ufw"
+    fi
+
+    if [[ -n "$PS_PREFIX" ]]; then
+        ps_cmd="${PS_PREFIX} ps"
     fi
 
     command+="export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH\"; "
@@ -1145,6 +1248,9 @@ build_snapshot_remote_command() {
         command+="printf '__SECTION__:UPTIME\n'; uptime 2>/dev/null || true; "
         command+="printf '__SECTION__:FREE\n'; free -m 2>/dev/null || true; "
         command+="printf '__SECTION__:NGINXFD\n'; pid=\$(pgrep -o nginx 2>/dev/null || true); if [ -z \"\$pid\" ]; then printf 'pid=none fds=n/a\n'; else fd_count=\$(${nginx_fd_count_cmd}); if [[ \"\$fd_count\" =~ ^[0-9]+$ ]]; then printf 'pid=%s fds=%s\n' \"\$pid\" \"\$fd_count\"; else printf 'pid=%s fds=n/a\n' \"\$pid\"; fi; fi; "
+        command+="printf '__SECTION__:PSMEM\n'; ${ps_cmd} aux --sort=-%mem 2>/dev/null | head -n $(( TOP_N + 1 )) || true; "
+        command+="printf '__SECTION__:PSTHREADS\n'; ${ps_cmd} -eLf 2>/dev/null | awk '/python/ && \$0 !~ /awk/ {count++} END {printf \"threads=%d\\n\", count+0}' || true; "
+        command+="printf '__SECTION__:GUNICORN\n'; ${ps_cmd} -eo comm=,args= 2>/dev/null | awk '/gunicorn/ {count++} END {printf \"workers=%d\\n\", count+0}' || true; "
     fi
 
     if (( ENABLE_FAIL2BAN_STATUS == 1 )); then
